@@ -1,0 +1,577 @@
+"""Interactive setup wizard (v1.1).
+
+Two layers, deliberately separate:
+- Pure functions (this file, top section): provider testing, model listing,
+  selection rendering — no UI, fully unit-testable.
+- Dialog layer (bottom): prompt_toolkit dialogs for a real terminal, with a
+  numbered plain-input fallback for non-tty (same guard as tui.py).
+
+The wizard is the ONLY writer of ~/.kryonsec/config.toml (see config.py).
+"""
+
+from __future__ import annotations
+
+import json
+import urllib.error
+import urllib.request
+from typing import Any
+
+from .config import KryonsecConfig
+from .llm import ollama_models
+
+OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
+OPENAI_TIMEOUT_S = 15
+
+# /v1/models returns everything ever created under the key; the wizard menu
+# should show chat models. Excluded by id substring — err on showing fewer.
+_NON_CHAT_SUBSTRINGS = (
+    "embedding", "embed", "tts", "whisper", "moderation",
+    "dall-e", "dalle", "realtime", "audio", "transcribe",
+)
+
+
+def check_openai_key(api_key: str) -> tuple[bool, str]:
+    """Check an OpenAI key with a cheap authenticated GET.
+    Returns (ok, message)."""
+    if not api_key or not api_key.strip():
+        return False, "empty key"
+    req = urllib.request.Request(
+        OPENAI_MODELS_URL,
+        headers={"Authorization": f"Bearer {api_key.strip()}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=OPENAI_TIMEOUT_S) as r:
+            if r.status == 200:
+                return True, "key works"
+            return False, f"HTTP {r.status}"
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return False, f"rejected (HTTP {e.code}) — wrong or revoked key"
+        return False, f"HTTP {e.code}"
+    except Exception as e:
+        return False, f"network error: {e}"
+
+
+def list_openai_models(api_key: str) -> list[dict[str, Any]] | None:
+    """Chat-capable models for the key, most recent first.
+    None = request failed (caller shows an error); [] = key fine but no
+    models survived the filter."""
+    req = urllib.request.Request(
+        OPENAI_MODELS_URL,
+        headers={"Authorization": f"Bearer {api_key.strip()}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=OPENAI_TIMEOUT_S) as r:
+            data = json.loads(r.read())
+    except Exception:
+        return None
+    models = data.get("data", [])
+    chat_models = [
+        m for m in models
+        if not any(s in m.get("id", "").lower() for s in _NON_CHAT_SUBSTRINGS)
+    ]
+    chat_models.sort(key=lambda m: m.get("created", 0), reverse=True)
+    return chat_models
+
+
+def ollama_model_names(host: str) -> list[str] | None:
+    """Models pulled on the Ollama server (None = server down)."""
+    return ollama_models(host)
+
+
+# MCP servers offered in the wizard menu (preset list; users can add custom).
+# command is what runs in a shell to start the stdio server.
+# args marked "{ask}" are filled in by asking the user during setup.
+MCP_PRESETS = [
+    {
+        "name": "fetch",
+        "command": "uvx mcp-server-fetch",
+        "args": [],
+        "env": {},
+        "description": "fetch web pages as clean text (no API key needed)",
+    },
+    {
+        "name": "filesystem",
+        "command": "npx -y @modelcontextprotocol/server-filesystem",
+        "args": ["{ask}"],  # allowed directory — the server refuses to start without one
+        "env": {},
+        "description": "file access through the MCP standard (needs node)",
+    },
+]
+
+
+# ===========================================================================
+# Dialog layer — prompt_toolkit on a real terminal, numbered prompts when
+# stdin is not a tty (same guard pattern as tui.py). Every interactive
+# step has a pure "pick" function so the flow is unit-testable.
+# ===========================================================================
+
+from pathlib import Path
+import sys
+
+
+def _is_tty() -> bool:
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+BANNER = r"""
+  ██╗  ██╗██████╗ ██╗   ██╗ ██████╗ ███╗   ██╗███████╗███████╗ ██████╗
+  ██║ ██╔╝██╔══██╗╚██╗ ██╔╝██╔═══██╗████╗  ██║██╔════╝██╔════╝██╔════╝
+  █████╔╝ ██████╔╝ ╚████╔╝ ██║   ██║██╔██╗ ██║███████╗█████╗  ██║
+  ██╔═██╗ ██╔══██╗  ╚██╔╝  ██║   ██║██║╚██╗██║╚════██║██╔══╝  ██║
+  ██║  ██║██║  ██║   ██║   ╚██████╔╝██║ ╚████║███████║███████║╚██████╗
+  ╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚══════╝╚══════╝ ╚═════╝
+"""
+
+
+def _pick_provider(answers: list[str] | None = None) -> str:
+    """Provider choice. answers is the plain-input fallback queue (tests)."""
+    if _is_tty() and not answers:
+        from prompt_toolkit.shortcuts import radiolist_dialog
+
+        result = radiolist_dialog(
+            title="Kryonsec setup — LLM provider",
+            text="Which LLM provider do you want to use?",
+            values=[("openai", "OpenAI (needs an API key)"),
+                    ("ollama", "Ollama (local, free)"),
+                    ("bedrock", "AWS Bedrock (needs an AWS Bedrock API key)")],
+        ).run()
+        if result is None:
+            raise KeyboardInterrupt
+        return result
+    answer = (answers or []).pop(0) if answers else input(
+        "LLM provider?\n"
+        "  1. OpenAI (needs an API key)\n"
+        "  2. Ollama (local, free)\n"
+        "  3. AWS Bedrock (needs an AWS Bedrock API key)\n> ")
+    answer = answer.strip().lower()
+    # "o" is NOT an OpenAI abbreviation — it reads as Ollama. Spell it out.
+    # Bedrock stays LAST in the list so the numbering above never shifts.
+    return {"1": "openai", "openai": "openai",
+            "3": "bedrock", "bedrock": "bedrock"}.get(answer, "ollama")
+
+
+def _ask_key(answers: list[str] | None = None, title: str = "OpenAI API key",
+             prompt: str = "Paste your OpenAI API key (sk-…):") -> str:
+    if _is_tty() and not answers:
+        from prompt_toolkit.shortcuts import input_dialog
+
+        result = input_dialog(
+            title=title,
+            text=prompt,
+            password=True,
+        ).run()
+        if result is None:
+            raise KeyboardInterrupt
+        return result.strip()
+    return (answers or []).pop(0).strip() if answers else input(f"{title}: ").strip()
+
+
+def _pick_model(
+    models: list[str],
+    answers: list[str] | None = None,
+    noun: str = "model",
+    sort_note: str = "most recent first",
+) -> str:
+    """Choose one entry from a list.
+
+    `noun`/`sort_note` name the list being shown: Bedrock reuses this to
+    pick a region, and "Available models (most recent first)" would be a
+    lie there.
+    """
+    if _is_tty() and not answers:
+        from prompt_toolkit.shortcuts import radiolist_dialog
+
+        result = radiolist_dialog(
+            title=f"Choose your {noun}",
+            text=f"{len(models)} {noun}s available ({sort_note}). Pick one:",
+            values=[(m, m) for m in models],
+        ).run()
+        if result is None:
+            raise KeyboardInterrupt
+        return result
+    print(f"Available {noun}s ({sort_note}):")
+    for i, m in enumerate(models, 1):
+        print(f"  {i}. {m}")
+    raw = (answers or []).pop(0) if answers else input(f"{noun} number: ")
+    raw = raw.strip()
+    if raw.isdigit() and 1 <= int(raw) <= len(models):
+        return models[int(raw) - 1]
+    # free text: accept if it matches an entry (or as a raw model id)
+    for m in models:
+        if m == raw:
+            return raw
+    return raw  # trust it — the provider test already ran / caller validates
+
+
+def _pick_many(
+    title: str,
+    options: list[tuple[str, str]],  # (value, label)
+    answers: list[str] | None = None,
+) -> list[str]:
+    """Multi-select: space toggles + enter accepts (dialog); comma numbers
+    in plain mode (e.g. '1,3'). Blank = none selected."""
+    if _is_tty() and not answers:
+        from prompt_toolkit.shortcuts import checkboxlist_dialog
+
+        result = checkboxlist_dialog(
+            title=title,
+            text="Space to select/deselect, Enter to continue",
+            values=options,
+        ).run()
+        if result is None:
+            return []
+        return list(result)
+    print(title)
+    for i, (_, label) in enumerate(options, 1):
+        print(f"  {i}. {label}")
+    raw = (answers or []).pop(0) if answers else input("numbers (e.g. 1,3; blank = none): ")
+    picked: list[str] = []
+    for part in raw.replace(" ", "").split(","):
+        if part.isdigit() and 1 <= int(part) <= len(options):
+            picked.append(options[int(part) - 1][0])
+    return picked
+
+
+def _pick_bedrock_model(
+    models: list[dict], answers: list[str] | None = None
+) -> str:
+    """Choose a Bedrock model: show the readable name AND the model id,
+    return the id (what litellm needs)."""
+    if _is_tty() and not answers:
+        from prompt_toolkit.shortcuts import radiolist_dialog
+
+        result = radiolist_dialog(
+            title="Choose your Bedrock model",
+            text=f"{len(models)} models available (cross-region profiles first).",
+            values=[(m["id"], f"{m['label']}  —  {m['id']}") for m in models],
+        ).run()
+        if result is None:
+            raise KeyboardInterrupt
+        return result
+    print(f"Available Bedrock models ({len(models)}, cross-region profiles first):")
+    for i, m in enumerate(models, 1):
+        print(f"  {i}. {m['label']}\n     {m['id']}")
+    raw = (answers or []).pop(0) if answers else input("model number: ")
+    raw = raw.strip()
+    if raw.isdigit() and 1 <= int(raw) <= len(models):
+        return models[int(raw) - 1]["id"]
+    return raw  # a typed-in model id — trust it, same as _pick_model
+
+
+def _ask_optional_key(title: str, answers: list[str] | None = None) -> str:
+    """Ask for an optional API key. Blank = skip (the source is simply
+    not configured — keyless passive sources always run either way)."""
+    if _is_tty() and not answers:
+        from prompt_toolkit.shortcuts import input_dialog
+
+        result = input_dialog(title=title, text=f"{title} (blank = skip):",
+                              password=True).run()
+        if result is None:
+            return ""
+        return result.strip()
+    raw = (answers or []).pop(0) if answers else input(f"{title} (blank = skip): ")
+    return raw.strip()
+
+
+def _ask_yes_no(question: str, answers: list[str] | None = None) -> bool:
+    if _is_tty() and not answers:
+        from prompt_toolkit.shortcuts import yes_no_dialog
+
+        return bool(yes_no_dialog(title=question, text=question).run())
+    raw = (answers or []).pop(0) if answers else input(f"{question} [y/N]: ")
+    return raw.strip().lower() in ("y", "yes", "1")
+
+
+def _setup_bedrock(
+    cfg: KryonsecConfig, console, answers: list[str] | None = None
+) -> bool:
+    """The Bedrock branch of the wizard.
+
+    Returns True when cfg is configured, False to send the caller back to
+    the provider question (bad/missing key, or no model chosen).
+    """
+    from .bedrock import (
+        BEDROCK_KEY_HELP,
+        format_model_id,
+        list_bedrock_models,
+        probe_regions,
+    )
+
+    console.print(f"[dim]{BEDROCK_KEY_HELP}[/dim]")
+
+    # A Bedrock API key is opaque and carries no region, so the probe below
+    # is BOTH the key check and the region lookup: nothing answers 200 when
+    # the key is wrong, revoked or expired.
+    key = ""
+    while True:
+        key = _ask_key(
+            answers,
+            title="AWS Bedrock API key",
+            prompt="Paste your Bedrock API key (ABSK…):",
+        )
+        if not key:
+            console.print("[yellow]no key entered[/yellow]")
+            return False
+        console.print("[dim]checking which AWS region your key works in…[/dim]")
+        regions = probe_regions(key)
+        if regions:
+            break
+        console.print(
+            "[red]that key was rejected in every AWS region[/red] — check it "
+            "is a Bedrock API key (starts with ABSK) and has not expired."
+        )
+        retry = (answers or []).pop(0) if answers else input("try again? [Y/n]: ")
+        if retry.strip().lower().startswith("n"):
+            return False
+
+    if len(regions) == 1:
+        region = regions[0]
+        console.print(f"[green]region detected from your key:[/green] {region}")
+    else:
+        # Some keys are valid in more than one region — let the user choose
+        # rather than guessing, since it decides where calls are billed.
+        console.print(f"[green]your key works in {len(regions)} regions[/green]")
+        region = _pick_model(regions, answers, noun="region", sort_note="most common first")
+
+    models = list_bedrock_models(key, region)
+    if models:
+        model_id = _pick_bedrock_model(models, answers)
+    else:
+        console.print(
+            "[yellow]could not list models for that region — type the model "
+            "id manually[/yellow]\n"
+            "  e.g. anthropic.claude-3-5-sonnet-20241022-v2:0"
+        )
+        model_id = ((answers or []).pop(0) if answers else input("model id: ")).strip()
+    if not model_id:
+        return False
+
+    cfg.bedrock_api_key = key
+    cfg.bedrock_region = region
+    cfg.general_chat_model = format_model_id(model_id)
+    # search/compaction reuse the chosen model: a Bedrock account may not
+    # have every model enabled, so a hardcoded default would fail
+    cfg.general_search_model = cfg.general_chat_model
+    cfg.compaction_model = cfg.general_chat_model
+    cfg.local_model = "ollama/llama3.1"  # local fallback stays available
+    console.print(
+        "[yellow]note:[/yellow] this model must also be enabled for your "
+        "account under Bedrock > Model access, or calls fail with "
+        "AccessDenied."
+    )
+    return True
+
+
+def run_setup(cfg: KryonsecConfig, answers: list[str] | None = None) -> KryonsecConfig:
+    """The full wizard flow. Mutates and returns cfg; writes config.toml
+    on success. answers: scripted plain-mode input (tests / pipes)."""
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+
+    console = Console()
+    console.print(Panel.fit("[bold cyan]KRYONSEC SETUP[/bold cyan] — first-time configuration"))
+
+    # ---- 1. provider + key + model --------------------------------------
+    # loops back to the provider question when the chosen provider isn't
+    # usable (Ollama down). An unusable provider used to abort setup
+    # entirely — leaving no config and no obvious next step.
+    while True:
+        provider = _pick_provider(answers)
+        cfg.provider = provider
+
+        if provider == "openai":
+            while True:
+                key = _ask_key(answers)
+                ok, msg = check_openai_key(key)
+                if ok:
+                    break
+                console.print(f"[red]key check failed:[/red] {msg}")
+                retry = (answers or []).pop(0) if answers else input("try again? [Y/n]: ")
+                if retry.strip().lower().startswith("n"):
+                    console.print("[yellow]setup aborted — no provider configured[/yellow]")
+                    return cfg
+            cfg.openai_api_key = key
+            models = list_openai_models(key)
+            model_ids = [m["id"] for m in (models or [])]
+            if not model_ids:
+                # key works but listing failed/empty — fall back to typing it
+                console.print("[yellow]could not list models — type the model id manually[/yellow]")
+                model_ids = [((answers or []).pop(0) if answers else input("model id: ")).strip()]
+            model = _pick_model(model_ids, answers)
+            cfg.general_chat_model = model
+            if not model.startswith("gpt"):
+                # a custom id may need the openai/ prefix for litellm routing
+                cfg.general_chat_model = f"openai/{model}"
+            # reuse the chosen chat model for search/compaction: forcing
+            # gpt-4o-mini breaks restricted keys and Azure-proxy model ids
+            cfg.general_search_model = cfg.general_chat_model
+            cfg.compaction_model = cfg.general_chat_model
+            cfg.local_model = "ollama/llama3.1"  # local fallback stays available
+            break
+
+        if provider == "bedrock":
+            # False (bad key, no model) loops back to the provider question
+            # rather than leaving the user with a half-written config
+            if _setup_bedrock(cfg, console, answers):
+                break
+            continue
+
+        names = ollama_model_names(cfg.ollama_host)
+        if not names:
+            console.print(
+                "[yellow]Ollama not answering at "
+                f"{cfg.ollama_host}[/yellow]\n"
+                "  start it (`ollama serve`) and pull a model "
+                "(`ollama pull llama3.1`) — or pick OpenAI instead."
+            )
+            continue
+        model = _pick_model(names, answers)
+        # only the implicit ':latest' tag can be dropped — 'llama3.1:8b'
+        # stripped to 'llama3.1' resolves to :latest (a different model
+        # the user never pulled) and fails at run time
+        base = model[:-len(":latest")] if model.endswith(":latest") else model
+        cfg.general_chat_model = f"ollama/{base}"
+        cfg.local_model = f"ollama/{base}"
+        # strict provider isolation: ollama config never calls a hosted API —
+        # and that includes keys left in config by a previous OpenAI setup
+        cfg.general_search_model = f"ollama/{base}"
+        cfg.compaction_model = f"ollama/{base}"
+        cfg.openai_api_key = None
+        break
+
+    # ---- 2. built-in tools ----------------------------------------------
+    from .config import BUILTIN_TOOLS
+
+    picked = _pick_many(
+        "Built-in tools for the general agent",
+        [(t, t) for t in BUILTIN_TOOLS],
+        answers,
+    )
+    cfg.enabled_tools = picked or []
+
+    # ---- 3. MCP servers ---------------------------------------------------
+    mcp_options = [(p["name"], f"{p['name']} — {p['description']}") for p in MCP_PRESETS]
+    mcp_options.append(("__custom__", "add a custom MCP server…"))
+    picked_mcp = _pick_many("MCP servers (optional)", mcp_options, answers)
+
+    servers: list[dict] = []
+    for preset in MCP_PRESETS:
+        if preset["name"] not in picked_mcp:
+            continue
+        # M13: warn BEFORE setup "succeeds" — a preset whose command is
+        # missing silently fails on the next chat session instead
+        import shutil as _shutil
+
+        first_token = preset["command"].split()[0]
+        if not _shutil.which(first_token):
+            console.print(
+                f"[yellow]warning:[/yellow] {preset['name']} needs "
+                f"[bold]{first_token}[/bold], which is not on PATH — install "
+                "it or this server won't start"
+            )
+        args = list(preset["args"])
+        if "{ask}" in args:
+            # e.g. the filesystem server needs an allowed directory
+            default_dir = str(Path.home())
+            prompt = (
+                f"{preset['name']}: allowed directory (Enter = {default_dir}, "
+                "'none' to skip this tool): "
+            )
+            raw = (answers or []).pop(0) if answers else input(prompt)
+            raw = raw.strip()
+            if raw.lower() in ("none", "skip"):
+                console.print(f"[yellow]{preset['name']} skipped[/yellow]")
+                continue
+            args = [raw or default_dir]
+        servers.append({
+            "name": preset["name"],
+            "command": preset["command"],
+            "args": args,
+            "env": dict(preset["env"]),
+        })
+    if "__custom__" in picked_mcp:
+        name = (answers or []).pop(0) if answers else input("server name: ")
+        command = (answers or []).pop(0) if answers else input("command to start it: ")
+        if name.strip() and command.strip():
+            servers.append({"name": name.strip(), "command": command.strip(), "args": [], "env": {}})
+    cfg.mcp_servers = servers
+
+    # ---- 4. passive-recon API keys (optional) ---------------------------
+    # Keyless Zone A sources (crt.sh, Wayback, OTX, RIPEstat) always run;
+    # these keys only add Shodan/Censys subdomain discovery.
+    console.print(
+        "[dim]Passive-recon API keys (optional) — Shodan/Censys add more "
+        "subdomain sources; keyless sources always run.[/dim]")
+    if _ask_yes_no("Add passive-recon API keys (Shodan / Censys)?", answers):
+        shodan = _ask_optional_key("Shodan API key", answers)
+        censys_id = _ask_optional_key("Censys API ID", answers)
+        censys_secret = _ask_optional_key("Censys API secret", answers)
+        if shodan:
+            cfg.shodan_api_key = shodan
+        if censys_id and censys_secret:
+            cfg.censys_api_id = censys_id
+            cfg.censys_api_secret = censys_secret
+            if not shodan:
+                console.print("[yellow]censys keys saved, shodan skipped[/yellow]")
+        elif censys_id or censys_secret:
+            console.print("[yellow]censys needs BOTH an ID and a secret — skipped[/yellow]")
+        # GitHub recon (Phase 8): optional — code search needs a token
+        github = _ask_optional_key("GitHub token (code search, optional)", answers)
+        if github:
+            cfg.github_token = github
+    else:
+        console.print("[dim]skipped — keyless passive sources only[/dim]")
+
+    # ---- 5. banner + summary + write --------------------------------------
+    cfg.ensure_dirs()
+    cfg.save()
+
+    from rich.panel import Panel
+
+    # banner: box art on UTF-8 consoles, ASCII on legacy code pages
+    from .cli import BANNER_ASCII, _UTF8_OK
+
+    console.print(
+        f"[bold white]{BANNER if _UTF8_OK else BANNER_ASCII}[/bold white]")
+    table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
+    table.add_column(style="dim")
+    table.add_column(style="bold")
+    table.add_row("provider", cfg.provider)
+    table.add_row("chat model", cfg.general_chat_model)
+    if cfg.provider == "bedrock":
+        table.add_row("aws region", cfg.bedrock_region)
+    table.add_row("local model", cfg.local_model)
+    table.add_row("tools", ", ".join(cfg.enabled_tools) or "none")
+    table.add_row("mcp servers", ", ".join(s["name"] for s in cfg.mcp_servers) or "none")
+    passive_keys = []
+    if cfg.shodan_api_key:
+        passive_keys.append("shodan")
+    if cfg.censys_api_id and cfg.censys_api_secret:
+        passive_keys.append("censys")
+    table.add_row("passive-recon keys", ", ".join(passive_keys) or "none (keyless sources only)")
+    table.add_row("workspace", str(cfg.workspace))
+    console.print(Panel(
+        table,
+        title="[bold cyan]KRYONSEC IS READY[/bold cyan]",
+        border_style="green",
+    ))
+    import sys as _sys
+
+    if not _sys.platform.startswith("linux"):
+        # L6: half the product is invisible on this platform — say so at
+        # the end of setup, not only in the installer header
+        console.print(
+            "[yellow]note: Purple Team (penetration testing) needs "
+            "WSL2/Linux + Docker + gVisor — this machine runs the "
+            "Copilot only. `kryonsec doctor` shows the details.[/yellow]")
+    console.print(
+        f"[dim]config: {Path(cfg.home) / 'config.toml'}[/dim]\n"
+        "[green]type `kryonsec` to start — `kryonsec doctor` checks "
+        "everything again anytime.[/green]")
+    return cfg
+

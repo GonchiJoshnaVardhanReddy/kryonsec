@@ -1,0 +1,164 @@
+{#- Engagement report (spec v2.1.1 §4.9). Rendered to report.md.
+    Simple plain English — the reader may not be technical. -#}
+# Security Test Report
+
+**Engagement:** {{ engagement_id }}
+**Target website:** {{ target }}
+**Date:** {{ generated_at }}
+
+## What we did
+
+{% set tested = hypotheses | selectattr('approved', 'equalto', true) | list | length %}
+{% set exploit_ran = (exploit_attempts | length) > 0 %}
+
+We collected public information about {{ target }} from third-party
+sources (certificate records and web archives). We did **not** send any
+traffic to the website during this step.
+
+Based on that information, the assistant suggested
+{{ hypotheses | list | length }} possible security issues.
+You approved {{ tested }} of them
+{% if not tested %}(you approved none){% endif %}.
+
+{% if exploit_ran %}
+Tools were run against the target to test the approved items.
+Here is what each test did:
+
+{% for a in attempts %}
+- **{{ a.label }}** ({{ a.properties.tool }}): ran
+  {%- if a.properties.confirmed %} and **found the issue confirmed**{% endif %}.
+{% endfor %}
+{% else %}
+**No testing was done against the website.** The approved items were
+not checked — the automated testing phase did not run in this
+engagement, so every issue below is an unconfirmed suggestion.
+{% endif %}
+
+{% if halt_reason %}
+The engagement stopped early. Reason: {{ halt_reason }}.
+{% endif %}
+
+## Timeline
+
+{% if timeline %}
+| When (UTC) | What happened |
+|---|---|
+{% for t in timeline %}| {{ t.ts }} | {{ t.event }}{% if t.detail %} — {{ t.detail }}{% endif %} |
+{% endfor %}
+{% else %}
+No timeline events were recorded in the audit chain.
+{% endif %}
+
+## How the testing was done (steps you can repeat)
+
+{% if attempts %}
+A tester can check any item below by hand. Every test was run inside a
+locked-down sandbox container, one test at a time, against the target
+website only.
+
+{% for a in attempts %}
+### Steps for {{ a.label }}
+
+1. The tool {{ a.properties.tool }} was run with these settings:
+   `{{ a.properties.argv | join(' ') }}`
+2. The tool sent test requests to the target website and watched how
+   it answered.
+3. Result: {% if a.properties.confirmed %}the tool said the issue is real ("confirmed"). The tool's own words:
+   `{{ a.properties.output_excerpt | trim | truncate(200) }}`{% else %}the tool did not find the issue (it checked and got no proof).{% endif %}
+
+To repeat it yourself: run the same command (shown in step 1) in a safe
+test environment and compare what the tool answers. Only test websites
+you are allowed to test.
+{% endfor %}
+{% else %}
+No test steps to show — no tools were run in this engagement.
+{% endif %}
+
+## What we found about the target
+
+**Subdomains found:** {{ subdomains | length }}
+{% for s in subdomains[:20] %}
+- {{ s }}
+{% else %}
+- none found
+{% endfor %}
+
+**Old pages found in the web archive:** {{ paths | length }}
+(a sample is listed; these are old URLs, not live pages)
+{% for p in paths[:20] %}
+- {{ p }}
+{% endfor %}
+
+## Possible security issues
+
+These are **suggestions only** — the assistant looked at public
+information and guessed what might be wrong. Nothing below is confirmed
+{% if not exploit_ran %}because no tests were run{% endif %}.
+
+{% for h in hypotheses %}
+### {{ h.id }} — {{ h.title }}
+- Where: {{ h.target_asset }}
+- How sure the assistant is: {{ "%.0f" | format((h.confidence or 0) * 100) }}%
+- Your decision: {{ "approved" if h.approved | default(false) else "not approved" }}
+{% if exploit_ran %}- Tested: {% if h.tested | default(false) %}yes{% else %}no{% endif %}{% endif %}
+{% if h.tested and h.confirmed | default(false) %}- Result: **confirmed by the test tool**{% endif %}
+{% if h.verified | default(false) %}- Double-checked: **yes — a second tool re-tested it and agreed**{% elif h.confirmed | default(false) %}- Double-checked: the second check ran but did not agree or could not run — treat this finding with care{% endif %}
+{% if h.cvss_vector %}- Severity guess (CVSS vector): {{ h.cvss_vector }}
+{% if h.cvss_score is not none %}  (calculated base score: {{ h.cvss_score }} — {{ h.cvss_qual }})
+{% else %}  (score could not be calculated)
+{% endif %}{% endif %}
+{% if h.enrichment.cve %}- Known risk data for {{ h.enrichment.cve }} (from public databases, looked up during the engagement):
+  - In CISA's list of actively-exploited bugs (KEV): {{ "YES — fix first" if h.enrichment.kev else ("no" if h.enrichment.kev is not none else "unknown (lookup failed)") }}
+  - Chance it gets exploited soon (EPSS score): {{ h.enrichment.epss if h.enrichment.epss is not none else "unknown" }}
+  - Public exploit code available: {{ "yes" if h.enrichment.exploit_available else "not found" }}
+{% if h.enrichment.cpes %}  - Affected software (CPE): {{ h.enrichment.cpes | join(", ") }}
+{% endif %}
+{% if h.enrichment.cwes %}  - Weakness types (CWE, from NVD): {{ h.enrichment.cwes | join(", ") }}
+{% endif %}
+{% if h.enrichment.osv_aliases or h.enrichment.affected_packages %}  - OSV database: {{ h.enrichment.osv_severity or "severity unknown" }}{% if h.enrichment.osv_aliases %}; also known as {{ h.enrichment.osv_aliases | join(", ") }}{% endif %}{% if h.enrichment.affected_packages %}; affects {{ h.enrichment.affected_packages | join(", ") }}{% endif %}
+{% endif %}
+{% if h.enrichment.ghsa_id %}  - GitHub Advisory {{ h.enrichment.ghsa_id }}: {{ h.enrichment.ghsa_severity or "severity unknown" }}{% if h.enrichment.patched_versions %}; fixed in {{ h.enrichment.patched_versions | join(", ") }}{% endif %}
+{% endif %}
+{% if h.enrichment.nuclei_templates %}  - Public scanning templates (nuclei): {{ h.enrichment.nuclei_templates | map(attribute='id') | join(", ") }}
+{% endif %}
+{% endif %}
+- Why it thinks this: {{ h.rationale }}
+- How to check it: {{ h.tools | join(", ") if h.tools else "(no tool suggested)" }}
+
+{% else %}
+No issues were suggested for this target.
+{% endfor %}
+
+## Code scanning results (blue team)
+
+{% if scanners %}
+{% if sbom_summary %}{{ sbom_summary }}
+{% endif %}{% for s in scanners %}
+- {{ s.label }}: {{ s.findings_count if s.findings_count is not none else "ran" }} (exit {{ s.exit_code }}) — {{ s.excerpt }}
+{% endfor %}
+{% else %}
+No code scanners ran (no --code folder was provided, or the sandbox was unavailable).
+{% endif %}
+
+## How to fix them (blue team advice)
+
+{% for r in remediations %}
+### Fix for {{ r.hypothesis_id }} — {{ r.title }}
+- How serious: {{ r.severity }}
+- What to do: {{ r.fix }}
+{% if r.detection %}- How to spot attacks: {{ r.detection }}{% endif %}
+{% if r.cwe or r.owasp or r.attack or r.owasp_api %}- Weakness types (suggested, not verified): {{ r.cwe if r.cwe else "—" }}{{ "; " if r.cwe and r.owasp }}{{ r.owasp if r.owasp else "—" }}{{ "; " if (r.cwe or r.owasp) and r.attack }}{{ r.attack if r.attack else "—" }}{{ "; " if (r.cwe or r.owasp or r.attack) and r.owasp_api }}{{ r.owasp_api if r.owasp_api else "—" }}{% endif %}
+
+{% else %}
+No fix advice was generated.
+{% endfor %}
+
+## Proof this report is genuine
+
+Every step of this engagement was recorded in a tamper-proof log.
+The log's final fingerprint is:
+
+`{{ audit_head }}`
+
+Anyone can check the log file (`engagements/{{ engagement_id }}/audit.jsonl`)
+against this fingerprint to prove nothing was changed after the fact.

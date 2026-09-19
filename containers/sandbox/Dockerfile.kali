@@ -1,0 +1,158 @@
+# Kryonsec Zone B sandbox image (spec v2.1.1 §8.5).
+#
+# Build (inside WSL2, from the repo root):
+#   docker build -t kryonsec/sandbox -f containers/sandbox/Dockerfile.kali .
+#
+# Pin by digest after the smoke test (spec §8.6):
+#   docker inspect --format '{{index .RepoDigests 0}}' kryonsec/sandbox
+# Then set KRYONSEC_SANDBOX_IMAGE in the environment / .env.
+FROM kalilinux/kali-rolling:latest
+
+# jq is REQUIRED (entrypoint uses it) and is NOT in the base image.
+# Minimal toolset only: no metasploit-framework/beef-xss/setoolkit
+# (never installed here — the allowlist + image contents are the control).
+# Core block = the original, known-good set. Keep it separate so a flaky
+# extended block can never regress the core tools.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    jq \
+    nmap \
+    dnsutils \
+    curl \
+    netcat-traditional \
+    python3 \
+    python3-pip \
+    nuclei \
+    sqlmap \
+    nikto \
+    gobuster \
+    ffuf \
+    seclists \
+    wget \
+    ca-certificates \
+    openssl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Tool-expansion block (2026-09-13). Kali package names drift; if the
+# batch install fails, retry per-package so ONE bad name doesn't drop the
+# whole extended set. Unavailable packages log a WARN and are simply
+# absent (spawning them then fails inside the sandbox — audited, safe).
+# ncat ships with the nmap package; nc comes from netcat-traditional.
+# searchsploit ships with exploitdb.
+# checkov is deliberately NOT in this list: Kali has no checkov package
+# (pkg.kali.org/pkg/checkov is a 404), so naming it here only produced a
+# per-build "WARN: checkov unavailable" while the tool stayed missing. It
+# is a Python tool and is installed from PyPI below instead.
+RUN EXTENDED_TOOLS=" \
+    amass subfinder assetfinder naabu dnsx httpx-toolkit rustscan whatweb \
+    katana hakrawler feroxbuster sslscan testssl.sh dalfox commix \
+    wfuzz arjun exploitdb httpie \
+    semgrep bandit gitleaks trivy hadolint kube-bench \
+    gowitness massdns impacket-scripts \
+    " && apt-get update && \
+    (apt-get install -y --no-install-recommends $EXTENDED_TOOLS || \
+     for t in $EXTENDED_TOOLS; do \
+        apt-get install -y --no-install-recommends "$t" \
+          || echo "WARN: $t unavailable in this Kali snapshot"; \
+     done) && rm -rf /var/lib/apt/lists/*
+
+# Bake nuclei templates at BUILD time, not runtime (sandbox has no
+# internet egress to template sources). The tool runs as
+# kryonsec-runner (non-root), so move the templates OUT of /root into a
+# world-readable dir — otherwise every nuclei spawn dies on permissions.
+RUN nuclei -update-templates || true; \
+    mkdir -p /opt/nuclei-templates && \
+    cp -r /root/nuclei-templates/* /opt/nuclei-templates/ 2>/dev/null || true; \
+    chmod -R a+rX /opt/nuclei-templates 2>/dev/null || true
+
+# PyPI tools, installed ONE AT A TIME. A single `pip install a b c` is
+# all-or-nothing: one unresolvable name aborts the whole command and
+# installs NOTHING — and the trailing `|| WARN` hides it. That is exactly
+# how bloodhound-python, jwt_tool AND graphql-cop all went missing in the
+# same build: the old line asked for `bloodhound.py`, `jwt-tool` and
+# `graphql-cop`, and NONE of those three names exists on PyPI (checked
+# with `pip index versions`). Per-package installs make one bad name cost
+# only that one tool — the same rule as the apt block above.
+#   bloodhound-python -> the real PyPI name; provides `bloodhound-python`
+#   checkov           -> no Kali package (see the apt note above), on PyPI
+# semgrep is NOT here: Kali ships it and the apt install above works.
+RUN for pkg in bloodhound-python checkov; do \
+      pip install --no-cache-dir --break-system-packages \
+        --index-url https://pypi.org/simple/ \
+        --timeout 60 --retries 3 "$pkg" \
+        || echo "WARN: $pkg not installed (PyPI unreachable?)"; \
+    done
+
+# GitHub-hosted tools (no apt package). All best-effort with the same
+# rule as pip above: absent tool = audited spawn failure, never a silent
+# security hole. EVERY download is pinned (tag or commit SHA — never
+# `latest` or a branch head): a rebuild months later must get the exact
+# code that was smoke-tested (M11). Bump pins deliberately, like deps.
+# wget gets --tries/--timeout: a flaky network once left a truncated
+# kr tarball and a 0-byte grype that the || WARN path happily accepted.
+RUN mkdir -p /opt/tools && cd /opt/tools && \
+    (wget -q --tries=3 --timeout=30 https://github.com/peass-ng/PEASS-ng/releases/download/20260914-474d0061/linpeas.sh -O /usr/local/bin/linpeas.sh \
+      || echo "WARN: linpeas.sh not installed") && \
+    (wget -q --tries=3 --timeout=30 https://github.com/DominicBreuker/pspy/releases/download/v1.2.1/pspy64 -O /usr/local/bin/pspy64 \
+      || echo "WARN: pspy64 not installed") && \
+    (wget -q --tries=3 --timeout=30 https://raw.githubusercontent.com/mzet-/linux-exploit-suggester/937cf955501fe7da85994c98f0ca6151194e7c1d/linux-exploit-suggester.sh -O /usr/local/bin/linux-exploit-suggester.sh \
+      || echo "WARN: linux-exploit-suggester not installed") && \
+    (wget -q --tries=3 --timeout=30 https://github.com/assetnote/kiterunner/releases/download/v1.0.2/kiterunner_1.0.2_linux_amd64.tar.gz -O kr.tar.gz \
+      && tar xzf kr.tar.gz kr && mv kr /usr/local/bin/kr && rm -f kr.tar.gz \
+      || echo "WARN: kiterunner (kr) not installed") && \
+    (wget -q --tries=3 --timeout=30 https://github.com/swisskyrepo/SSRFmap/archive/290e07d75c52d68e021b6d0b4200c2a41ea20365.tar.gz -O ssrfmap.tar.gz \
+      && mkdir -p /opt/tools/SSRFmap && tar xzf ssrfmap.tar.gz -C /opt/tools/SSRFmap --strip-components=1 \
+      && cd /opt/tools/SSRFmap \
+      && pip install --no-cache-dir --break-system-packages dnslib dnspython flask tldextract \
+      && sed -i '1s|^#!.*|#!/usr/bin/env python3|' ssrfmap.py \
+      && ln -s /opt/tools/SSRFmap/ssrfmap.py /usr/local/bin/ssrfmap && rm -f /opt/tools/ssrfmap.tar.gz \
+      || echo "WARN: ssrfmap not installed") && \
+    (wget -q --tries=3 --timeout=30 https://github.com/epinna/tplmap/archive/616b0e527f62dd0930e6346ede6bef79e9bcf717.tar.gz -O tplmap.tar.gz \
+      && mkdir -p /opt/tools/tplmap && tar xzf tplmap.tar.gz -C /opt/tools/tplmap --strip-components=1 \
+      && ln -s /opt/tools/tplmap/tplmap.py /usr/local/bin/tplmap && rm -f /opt/tools/tplmap.tar.gz \
+      || echo "WARN: tplmap not installed") && \
+    (wget -q --tries=3 --timeout=30 https://github.com/anchore/syft/releases/download/v1.26.0/syft_1.26.0_linux_amd64.tar.gz -O /tmp/syft.tar.gz \
+      && tar xzf /tmp/syft.tar.gz -C /tmp syft && mv /tmp/syft /usr/local/bin/syft && rm -f /tmp/syft.tar.gz \
+      || echo "WARN: syft not installed (SBOM scan unavailable)") && \
+    (wget -q --tries=3 --timeout=30 https://github.com/anchore/grype/releases/download/v0.95.0/grype_0.95.0_linux_amd64.tar.gz -O /tmp/grype.tar.gz \
+      && tar xzf /tmp/grype.tar.gz -C /tmp grype && mv /tmp/grype /usr/local/bin/grype && rm -f /tmp/grype.tar.gz \
+      || echo "WARN: grype not installed (dependency vuln scan unavailable)") && \
+    (wget -q --tries=3 --timeout=30 https://github.com/google/osv-scanner/releases/download/v2.0.2/osv-scanner_linux_amd64 -O /usr/local/bin/osv-scanner \
+      && chmod 0755 /usr/local/bin/osv-scanner \
+      || echo "WARN: osv-scanner not installed (OSV dependency scan unavailable)") && \
+    (wget -q --tries=3 --timeout=30 https://github.com/ticarpi/jwt_tool/archive/refs/tags/v2.3.0.tar.gz -O /tmp/jwt.tar.gz \
+      && mkdir -p /opt/tools/jwt_tool \
+      && tar xzf /tmp/jwt.tar.gz -C /opt/tools/jwt_tool --strip-components=1 \
+      && pip install --no-cache-dir --break-system-packages -r /opt/tools/jwt_tool/requirements.txt \
+      && sed -i '1s|^#!.*|#!/usr/bin/env python3|' /opt/tools/jwt_tool/jwt_tool.py \
+      && chmod 0755 /opt/tools/jwt_tool/jwt_tool.py \
+      && ln -sf /opt/tools/jwt_tool/jwt_tool.py /usr/local/bin/jwt_tool \
+      && rm -f /tmp/jwt.tar.gz \
+      || echo "WARN: jwt_tool not installed") && \
+    (wget -q --tries=3 --timeout=30 https://github.com/dolevf/graphql-cop/archive/refs/tags/1.15.tar.gz -O /tmp/gqlcop.tar.gz \
+      && mkdir -p /opt/tools/graphql-cop \
+      && tar xzf /tmp/gqlcop.tar.gz -C /opt/tools/graphql-cop --strip-components=1 \
+      && pip install --no-cache-dir --break-system-packages -r /opt/tools/graphql-cop/requirements.txt \
+      && sed -i '1s|^#!.*|#!/usr/bin/env python3|' /opt/tools/graphql-cop/graphql-cop.py \
+      && chmod 0755 /opt/tools/graphql-cop/graphql-cop.py \
+      && ln -sf /opt/tools/graphql-cop/graphql-cop.py /usr/local/bin/graphql-cop \
+      && rm -f /tmp/gqlcop.tar.gz \
+      || echo "WARN: graphql-cop not installed") ; \
+    chmod 0755 /usr/local/bin/linpeas.sh /usr/local/bin/pspy64 \
+      /usr/local/bin/linux-exploit-suggester.sh 2>/dev/null || true
+
+# Baked enumeration/probe scripts — fixed argv, no free-form shell.
+# The host allowlist lists these by FULL PATH (never a bare python3
+# invocation with a file argument).
+COPY containers/sandbox/scripts/ /opt/kryonsec/
+RUN chmod 0755 /opt/kryonsec/*.py
+
+# Create non-root user for tool execution
+RUN useradd -m -s /bin/false kryonsec-runner
+
+# Evidence directory
+RUN mkdir -p /evidence && chown kryonsec-runner:kryonsec-runner /evidence
+
+COPY containers/sandbox/entrypoint.sh /entrypoint.sh
+RUN chmod 0755 /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
+USER kryonsec-runner

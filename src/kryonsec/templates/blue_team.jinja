@@ -1,0 +1,54 @@
+{#- BLUE_TEAM prompt (spec v2.1.1 §4.2): pure LLM, defensive recommendations. -#}
+You are generating defensive recommendations for a purple-team engagement.
+
+TARGET: {{ target }}
+
+HYPOTHESES FROM THE ENGAGEMENT (with operator decisions):
+
+{% for h in hypotheses %}
+- {{ h.id }}: {{ h.title }}
+  target: {{ h.target_asset }}
+  approved by operator: {{ h.approved | default(false) }}
+  status: {% if h.approved | default(false) %}tested-by-exploit-phase{% else %}proposed-only (not tested){% endif %}
+{% else %}
+- (no hypotheses — recommend hardening based on the target's public footprint only)
+{% endfor %}
+
+CONFIRMED FINDINGS (if any):
+
+{% for f in findings %}
+- {{ f.label }}: {{ f.title | default('') }}
+{% else %}
+- (none confirmed — this engagement stopped before active testing)
+{% endfor %}
+
+SCANNER EVIDENCE (static analysis of the provided code folder, mounted read-only):
+
+{% for s in scanners %}
+- {{ s.label }}: exit code {{ s.exit_code }}{% if s.findings_count is not none %}, ~{{ s.findings_count }} findings{% endif %}
+
+  {{ s.excerpt }}
+{% else %}
+- (no code folder scanned — recommend based on the engagement above)
+{% endfor %}
+
+Note: bandit and gitleaks EXIT 1 when they FIND something — that is a
+finding, not a tool failure. Scanner output is evidence to reason from;
+do not invent scanner results that are not shown.
+
+Your task:
+1. For EACH hypothesis above, write one remediation: a concrete fix the
+   defender can apply (not generic advice — name the exact change).
+2. Where possible, add a detection signature: what log line / alert / rule
+   would catch exploitation attempts for this issue.
+3. Set severity: low, medium, high, or critical.
+4. Treat unapproved/untested hypotheses as "risk to verify", not confirmed
+   vulnerabilities — word the fix accordingly.
+5. Ground fixes in the scanner evidence when it is relevant; you may also
+   write remediations for scanner findings that no hypothesis covers
+   (use the scanner tool name as hypothesis_id, e.g. "semgrep").
+6. Where you are confident, suggest mappings — cwe (e.g. CWE-89), owasp
+   (e.g. A03:2021-Injection), attack (MITRE ATT&CK, e.g. T1190), and
+   owasp_api for API-shaped issues (e.g. API1:2023-BOLA). These
+   are SUGGESTIONS for the defender to verify, not established fact —
+   leave them empty rather than guess.

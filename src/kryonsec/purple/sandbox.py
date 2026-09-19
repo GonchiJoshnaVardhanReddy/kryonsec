@@ -1,0 +1,266 @@
+"""Kali sandbox spawn (spec v2.1.1 §8.5/§8.6).
+
+Runs one allowlisted tool inside the gVisor sandbox container:
+argv as container args (never a shell string), pinned image, runsc
+runtime, resource limits, non-root user, read-only rootfs, bounded
+output. The entrypoint inside the image re-checks the tool allowlist
+(defense-in-depth) and emits JSON: {"exit_code": N, "stdout": "..."}.
+
+The docker invocation is injectable so tests run anywhere; only the
+real run needs Linux + Docker + runsc + the pinned image.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable
+
+from ..config import KryonsecConfig
+
+log = logging.getLogger(__name__)
+
+# Match the entrypoint's internal tool timeout (300s) + a small margin.
+DEFAULT_TIMEOUT_S = 330
+
+
+@dataclass
+class SpawnResult:
+    ok: bool                 # did the spawn itself work (docker + parse)
+    exit_code: int           # the TOOL's exit code (from the JSON payload)
+    stdout: str              # the tool's raw output
+    error: str = ""          # spawn/parse failure reason
+    truncated: bool = False  # output was bounded
+
+
+class SandboxSpawnError(RuntimeError):
+    pass
+
+
+def _seccomp_default() -> Path:
+    """Shipped inside the package so installed wheels find it too."""
+    return Path(__file__).resolve().parents[1] / "containers" / "kryonsec-seccomp.json"
+
+
+class KaliSandbox:
+    """Spawns tools in the pinned Kali/gVisor container."""
+
+    def __init__(
+        self,
+        cfg: KryonsecConfig,
+        run_fn: Callable[..., subprocess.CompletedProcess] | None = None,
+        seccomp_profile: Path | None = None,
+        timeout_s: int = DEFAULT_TIMEOUT_S,
+        code_dir: str | None = None,
+        evidence_dir: str | None = None,
+    ):
+        self.cfg = cfg
+        self.image = cfg.sandbox_image
+        # Blue-team code scanning (Phase 5): an ABSOLUTE host path, mounted
+        # READ-ONLY at the fixed /code inside the container. The path comes
+        # from the CLI (--code), never the LLM; a relative path is refused
+        # outright rather than silently resolved against an unknown cwd.
+        if code_dir is not None:
+            # absolute on EITHER platform: production is Linux (posixpath),
+            # but Windows dev machines hand us "C:\\..." paths — both are
+            # fine, only a relative path (which would silently resolve
+            # against an unknown cwd) is refused
+            import posixpath
+
+            if not (Path(code_dir).is_absolute() or posixpath.isabs(code_dir)):
+                raise ValueError(
+                    f"code_dir must be an absolute path (got {code_dir!r})")
+            # stored verbatim — str(Path(...)) would mangle forward slashes
+            # to backslashes on Windows dev machines
+            self.code_dir = code_dir
+        else:
+            self.code_dir = None
+        # Evidence capture (Phase 8): gowitness screenshots etc. — an
+        # ABSOLUTE host path mounted READ-WRITE at the fixed /evidence.
+        # It is the ONLY read-write mount (rootfs and /code stay read-only);
+        # the path comes from the runner (engagement folder), never the LLM.
+        if evidence_dir is not None:
+            import posixpath
+
+            if not (Path(evidence_dir).is_absolute() or posixpath.isabs(evidence_dir)):
+                raise ValueError(
+                    f"evidence_dir must be an absolute path (got {evidence_dir!r})")
+            self.evidence_dir = evidence_dir  # verbatim, same rule as code_dir
+        else:
+            self.evidence_dir = None
+        if "@sha256:" not in self.image:
+            # rule 7: the image should be digest-pinned — a tag is mutable.
+            # Still runnable (install.sh builds a local :latest) but flagged.
+            log.warning(
+                "sandbox image %r is NOT digest-pinned — set "
+                "KRYONSEC_SANDBOX_IMAGE to kryonsec/sandbox@sha256:<digest> "
+                "(docker inspect --format '{{.Id}}' kryonsec/sandbox)",
+                self.image,
+            )
+        # injectable for tests: signature matches subprocess.run
+        self._run = run_fn or subprocess.run
+        self.seccomp_profile = seccomp_profile or _seccomp_default()
+        if self.seccomp_profile and not Path(self.seccomp_profile).is_file():
+            # M4: a missing packaged profile used to silently drop the
+            # seccomp flag — sandbox hardening (CLAUDE.md rule 9) must be loud
+            log.warning(
+                "seccomp profile %s not found — sandbox spawns will run "
+                "WITHOUT a seccomp filter (broken install? reinstall the "
+                "package or set KRYONSEC_SECCOMP_PROFILE)",
+                self.seccomp_profile,
+            )
+        self.timeout_s = timeout_s
+
+    def copy_with(
+        self, code_dir: str | None = None, evidence_dir: str | None = None
+    ) -> "KaliSandbox":
+        """Shallow copy with replaced mounts (same validation as __init__).
+
+        The runner constructs ONE sandbox per engagement and derives
+        per-state variants here — one construction also means one
+        image-pin warning, not one per state (M5).
+        """
+        import posixpath
+
+        clone = object.__new__(KaliSandbox)
+        clone.__dict__.update(self.__dict__)
+        if code_dir is not None:
+            if not (Path(code_dir).is_absolute() or posixpath.isabs(code_dir)):
+                raise ValueError(
+                    f"code_dir must be an absolute path (got {code_dir!r})")
+            clone.code_dir = code_dir  # verbatim, same rule as __init__
+        if evidence_dir is not None:
+            if not (Path(evidence_dir).is_absolute() or posixpath.isabs(evidence_dir)):
+                raise ValueError(
+                    f"evidence_dir must be an absolute path (got {evidence_dir!r})")
+            clone.evidence_dir = evidence_dir
+        return clone
+
+    def _docker_argv(self, tool_argv: list[str]) -> list[str]:
+        """Build the docker run argv. Tool argv as container args (spec §8.5)."""
+        argv = [
+            "docker", "run", "--rm",
+            "--name", self._container_name(),
+            "--runtime", "runsc",
+            "--user", "kryonsec-runner",
+            "--read-only",
+            "--tmpfs", "/tmp:size=100m",
+            "--memory", "2g",
+            "--cpus", "2",
+            "--pids-limit", "100",
+        ]
+        if self.seccomp_profile and Path(self.seccomp_profile).is_file():
+            argv += ["--security-opt", f"seccomp={self.seccomp_profile}"]
+        # read-only code mount (blue-team scanners, Phase 5): :ro so no
+        # scanner can write to the user's folder; -w /code so tools with a
+        # default cwd still find the code
+        if getattr(self, "code_dir", None):
+            argv += ["-v", f"{self.code_dir}:/code:ro", "-w", "/code"]
+        # read-write evidence mount (Phase 8): gowitness screenshots etc.
+        # land in the engagement folder. The ONLY rw mount — rootfs and
+        # /code stay read-only, so a tool can only write here.
+        if getattr(self, "evidence_dir", None):
+            argv += ["-v", f"{self.evidence_dir}:/evidence:rw"]
+        # NOTE: full spec adds network_mode=container:kryonsec-proxy for
+        # target-scope-only egress (§8.2). The proxy does not exist yet —
+        # containers use the default bridge. Recorded in the audit chain
+        # by the EXPLOIT subagent until the proxy lands.
+        argv += [self.image]
+        argv += list(tool_argv)
+        return argv
+
+    def _container_name(self) -> str:
+        """Per-spawn unique name so a timed-out container can be killed."""
+        import uuid
+
+        return f"kryonsec-sbx-{uuid.uuid4().hex[:12]}"
+
+    def _kill_container(self, name: str) -> None:
+        """Best-effort: a timed-out container keeps running on the daemon
+        after its docker CLI client is killed — stop the container itself."""
+        try:
+            subprocess.run(
+                ["docker", "kill", name], capture_output=True, timeout=15,
+            )
+        except Exception as e:  # never let cleanup mask the timeout report
+            log.warning("could not kill sandbox container %s: %s", name, e)
+
+    def spawn(self, tool_argv: list[str]) -> SpawnResult:
+        """Run one tool in the sandbox; parse the entrypoint's JSON payload.
+
+        tool_argv[0] is the tool name (must be allowlisted — the host-side
+        ToolAllowlist check happens BEFORE this is called; the image's
+        entrypoint re-checks it as defense-in-depth).
+        """
+        docker_argv = self._docker_argv(tool_argv)
+        container_name = docker_argv[docker_argv.index("--name") + 1]
+        log.info("sandbox spawn: %s", " ".join(docker_argv[:6]) + " …")
+
+        try:
+            proc = self._run(
+                docker_argv,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_s,
+            )
+        except subprocess.TimeoutExpired:
+            # killing the docker CLI leaves the container running on the
+            # daemon (still sending packets) — kill the container itself
+            self._kill_container(container_name)
+            return SpawnResult(
+                ok=False, exit_code=-1, stdout="",
+                error=f"tool exceeded {self.timeout_s}s sandbox timeout",
+            )
+        except Exception as e:
+            return SpawnResult(ok=False, exit_code=-1, stdout="", error=str(e))
+        except BaseException:
+            # Ctrl+C during a long scan, or a signal handler raising
+            # SystemExit. KeyboardInterrupt/SystemExit derive from
+            # BaseException, so `except Exception` above never saw them: the
+            # docker CLI died while the container kept running in the daemon,
+            # still sending packets at the target after the operator believed
+            # the engagement had stopped. Kill it, then let the interrupt
+            # propagate so Ctrl+C still stops the run.
+            self._kill_container(container_name)
+            raise
+
+        # The entrypoint prints one JSON object on stdout (rejections too —
+        # exit 125 with {"error": ...}); anything else (docker-level error)
+        # goes to stderr.
+        try:
+            payload = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            # the entrypoint writes its rejection JSON to stderr in older
+            # images — try that before giving up on a payload
+            try:
+                payload = json.loads(proc.stderr)
+            except (json.JSONDecodeError, TypeError):
+                err = (proc.stderr or proc.stdout or "")[:500]
+                return SpawnResult(
+                    ok=False, exit_code=proc.returncode, stdout="",
+                    error=f"no JSON payload from sandbox: {err}",
+                )
+
+        if "error" in payload:
+            # the entrypoint rejected the tool (not in image allowlist)
+            return SpawnResult(
+                ok=False, exit_code=proc.returncode, stdout="",
+                error=str(payload["error"]),
+            )
+
+        stdout = str(payload.get("stdout", ""))
+        truncated = False
+        limit = self.cfg.max_tool_output_chars
+        if len(stdout) > limit:
+            stdout = stdout[:limit]
+            truncated = True
+
+        return SpawnResult(
+            ok=True,
+            exit_code=int(payload.get("exit_code", proc.returncode)),
+            stdout=stdout,
+            truncated=truncated,
+        )

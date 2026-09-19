@@ -1,0 +1,62 @@
+{#- HYPOTHESIZE prompt (spec v2.1.1 §4.2): pure LLM, proposes hypotheses. -#}
+You are generating vulnerability hypotheses for a purple-team engagement.
+
+TARGET: {{ target }}
+
+PASSIVE RECON FINDINGS (third-party sources only, zero packets sent to target):
+
+Subdomains discovered:
+{% for s in subdomains %}
+- {{ s }}
+{% else %}
+- (none found)
+{% endfor %}
+
+IMPORTANT about subdomains: a hypothesis about a subdomain uses its full
+hostname in target_asset (e.g. "/webmail.{{ target }}/login"), NOT a path on
+{{ target }} — "https://{{ target }}/webmail/" does not exist when webmail
+runs on its own host.
+
+Archived paths (Wayback):
+{% for p in paths %}
+- {{ p }}
+{% else %}
+- (none found)
+{% endfor %}
+
+Other OSINT evidence (third-party sources; zero packets sent to target):
+{% for n in notes %}
+- {{ n }}
+{% else %}
+- (none)
+{% endfor %}
+
+Live services found by an active port scan (nmap):
+{% for s in services %}
+- {{ s.label }} — {{ s.service }}{% if s.version %} ({{ s.version }}){% endif %}
+{% else %}
+- (no scan results — the scan did not run)
+{% endfor %}
+
+Your task:
+1. For each asset above, hypothesize plausible vulnerabilities (max 10 total).
+2. Base every rationale ONLY on the evidence above (names, paths, the target itself).
+   Never claim a vulnerability was tested or confirmed.
+3. target_asset MUST be the clean base path WITH its parameter name and a
+   simple value (e.g. "/ListProducts.asp?artist=1"). Archived URLs often
+   contain old attack payloads in the parameter value — propose the CLEAN
+   URL, not the payload. Strip payload characters; keep the parameter.
+4. Prefer parameters that look like they reach a database (id, artist, cat,
+   product, search) over redirect parameters (RetURL, next, url).
+5. Suggest a CVSS 3.1 vector estimate for impact if it were confirmed.
+6. Suggest testing tools ONLY from this allowlist (generated from the
+   engine's allowlist — never edited by hand):
+   {{ tools | join(", ") }}.
+   These are the tools the execution engine can actually run. Any other
+   tool will be skipped.
+7. Give each hypothesis a confidence between 0.0 and 1.0.
+8. Do not repeat the same target_asset across hypotheses — each hypothesis
+   targets a different parameter or a different attack on it.
+
+Remember: you are proposing what MIGHT be true. The human operator approves
+or rejects each hypothesis before anything is executed against the target.
